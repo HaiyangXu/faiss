@@ -5,6 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+// -*- c++ -*-
+
 #pragma once
 
 #include <queue>
@@ -40,13 +42,10 @@ namespace faiss {
 struct VisitedTable;
 struct DistanceComputer; // from AuxIndexStructures
 struct HNSWStats;
-template <class C>
-struct ResultHandler;
 
 struct SearchParametersHNSW : SearchParameters {
     int efSearch = 16;
     bool check_relative_distance = true;
-    bool bounded_queue = true;
 
     ~SearchParametersHNSW() {}
 };
@@ -54,9 +53,6 @@ struct SearchParametersHNSW : SearchParameters {
 struct HNSW {
     /// internal storage of vectors (32 bits: this is expensive)
     using storage_idx_t = int32_t;
-
-    // for now we do only these distances
-    using C = CMax<float, int64_t>;
 
     typedef std::pair<float, storage_idx_t> Node;
 
@@ -115,6 +111,9 @@ struct HNSW {
     /// level of each vector (base level = 1), size = ntotal
     std::vector<int> levels;
 
+    // added to reference during hybrid construction
+    std::vector<storage_idx_t> nb_per_level;
+
     /// offsets[i] is the offset in the neighbors array where vector i is stored
     /// size ntotal + 1
     std::vector<size_t> offsets;
@@ -123,24 +122,39 @@ struct HNSW {
     /// for all levels. this is where all storage goes.
     std::vector<storage_idx_t> neighbors;
 
+
+    // this version of neighbors list contains metadata
+    /// neighbors[offsets[i]:offsets[i+1]] is the list of neighbors of vector i
+    /// for all levels. this is where all storage goes.
+    // for now this only supports small metadata as ints
+    std::vector<std::pair<storage_idx_t, int>> hybrid_neighbors;
+
     /// entry point in the search structure (one of the points with maximum
     /// level
-    storage_idx_t entry_point = -1;
+    storage_idx_t entry_point;
 
     faiss::RandomGenerator rng;
 
+    /// multiplier of M for max edges per vertex
+    int gamma;
+
+    int M;
+
     /// maximum level
-    int max_level = -1;
+    int max_level;
 
     /// expansion factor at construction time
-    int efConstruction = 40;
+    int efConstruction;
 
     /// expansion factor at search time
-    int efSearch = 16;
+    int efSearch;
 
     /// during search: do we check whether the next best distance is good
     /// enough?
     bool check_relative_distance = true;
+
+    /// number of entry points in levels > 0.
+    int upper_beam;
 
     /// use bounded queue during exploration
     bool search_bounded_queue = true;
@@ -149,7 +163,7 @@ struct HNSW {
 
     /// initialize the assign_probas and cum_nneighbor_per_level to
     /// have 2*M links on level 0 and M links on levels > 0
-    void set_default_probas(int M, float levelMult);
+    void set_default_probas(int M, float levelMult, int gamma = 1);
 
     /// set nb of neighbors for this level (before adding anything)
     void set_nb_neighbors(int level_no, int n);
@@ -167,7 +181,8 @@ struct HNSW {
             const;
 
     /// only mandatory parameter: nb of neighbors
-    explicit HNSW(int M = 32);
+    // explicit HNSW(int M = 32);
+    explicit HNSW(int M = 32, int gamma = 1);
 
     /// pick a random level for a new point
     int random_level();
@@ -183,7 +198,17 @@ struct HNSW {
             int level,
             omp_lock_t* locks,
             VisitedTable& vt,
-            bool keep_max_size_level0 = false);
+            std::vector<storage_idx_t> ep_per_level = {});
+
+    void hybrid_add_links_starting_from(
+            DistanceComputer& ptdis,
+            storage_idx_t pt_id,
+            storage_idx_t nearest,
+            float d_nearest,
+            int level,
+            omp_lock_t* locks,
+            VisitedTable& vt,
+            std::vector<storage_idx_t> ep_per_level = {});
 
     /** add point pt_id on all levels <= pt_level and build the link
      * structure for them. */
@@ -192,32 +217,73 @@ struct HNSW {
             int pt_level,
             int pt_id,
             std::vector<omp_lock_t>& locks,
-            VisitedTable& vt,
-            bool keep_max_size_level0 = false);
+            VisitedTable& vt);
+
+      /** add point pt_id on all levels <= pt_level and build the link
+     * structure for them. */
+    void hybrid_add_with_locks(
+            DistanceComputer& ptdis,
+            int pt_level,
+            int pt_id,
+            std::vector<omp_lock_t>& locks,
+            VisitedTable& vt);
 
     /// search interface for 1 point, single thread
     HNSWStats search(
             DistanceComputer& qdis,
-            ResultHandler<C>& res,
+            int k,
+            idx_t* I,
+            float* D,
             VisitedTable& vt,
             const SearchParametersHNSW* params = nullptr) const;
 
     /// search only in level 0 from a given vertex
     void search_level_0(
             DistanceComputer& qdis,
-            ResultHandler<C>& res,
+            int k,
+            idx_t* idxi,
+            float* simi,
             idx_t nprobe,
             const storage_idx_t* nearest_i,
             const float* nearest_d,
             int search_type,
             HNSWStats& search_stats,
+            VisitedTable& vt) const;
+    
+    /**************************************************************
+    * HYBRID INDEX
+    **************************************************************/
+    /// search interface for 1 point, single thread
+    int* metadata;
+    std::vector<std::string> metadata_strings;
+
+    
+    HNSWStats hybrid_search(
+            DistanceComputer& qdis,
+            int k,
+            idx_t* I,
+            float* D,
             VisitedTable& vt,
+            int filter,
+            Operation op,
+            std::string regex,
             const SearchParametersHNSW* params = nullptr) const;
+
+    /**************************************************************
+    **************************************************************/
 
     void reset();
 
     void clear_neighbor_tables(int level);
+
     void print_neighbor_stats(int level) const;
+    void print_edges(int level) const;
+
+    void hybrid_print_neighbor_stats(int level) const;
+    void hybrid_print_edges(int level) const;
+
+    void print_neighbor_stats(bool print_edges, bool is_hybrid) const; //overloaded
+
 
     int prepare_level_tab(size_t n, bool preset_levels = false);
 
@@ -225,60 +291,42 @@ struct HNSW {
             DistanceComputer& qdis,
             std::priority_queue<NodeDistFarther>& input,
             std::vector<NodeDistFarther>& output,
-            int max_size,
-            bool keep_max_size_level0 = false);
-
-    void permute_entries(const idx_t* map);
+            int max_size, int gamma = 1);
 };
 
 struct HNSWStats {
-    size_t n1 = 0; /// number of vectors searched
-    size_t n2 =
-            0; /// number of queries for which the candidate list is exhausted
-    size_t ndis = 0;  /// number of distances computed
-    size_t nhops = 0; /// number of hops aka number of edges traversed
+    size_t n1, n2, n3;
+    size_t ndis;
+    size_t nreorder;
+    // size_t n_upper;
+
+    HNSWStats(
+            size_t n1 = 0,
+            size_t n2 = 0,
+            size_t n3 = 0,
+            size_t n_upper = 0,
+            size_t ndis = 0,
+            size_t nreorder = 0)
+            : n1(n1), n2(n2), n3(n3), ndis(ndis), nreorder(nreorder) {}
 
     void reset() {
-        n1 = n2 = 0;
+        n1 = n2 = n3 = 0;
         ndis = 0;
-        nhops = 0;
+        nreorder = 0;
+        // n_upper = 0;
     }
 
     void combine(const HNSWStats& other) {
         n1 += other.n1;
         n2 += other.n2;
+        n3 += other.n3;
         ndis += other.ndis;
-        nhops += other.nhops;
+        nreorder += other.nreorder;
+        // n_upper += other.n_upper;
     }
 };
 
 // global var that collects them all
 FAISS_API extern HNSWStats hnsw_stats;
-
-int search_from_candidates(
-        const HNSW& hnsw,
-        DistanceComputer& qdis,
-        ResultHandler<HNSW::C>& res,
-        HNSW::MinimaxHeap& candidates,
-        VisitedTable& vt,
-        HNSWStats& stats,
-        int level,
-        int nres_in = 0,
-        const SearchParametersHNSW* params = nullptr);
-
-HNSWStats greedy_update_nearest(
-        const HNSW& hnsw,
-        DistanceComputer& qdis,
-        int level,
-        HNSW::storage_idx_t& nearest,
-        float& d_nearest);
-
-std::priority_queue<HNSW::Node> search_from_candidate_unbounded(
-        const HNSW& hnsw,
-        const HNSW::Node& node,
-        DistanceComputer& qdis,
-        int ef,
-        VisitedTable* vt,
-        HNSWStats& stats);
 
 } // namespace faiss
